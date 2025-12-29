@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"iter"
 	"slices"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +44,7 @@ import (
 
 	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
 	"github.com/kubeflow/trainer/v2/pkg/constants"
+	"github.com/kubeflow/trainer/v2/pkg/metrics"
 	"github.com/kubeflow/trainer/v2/pkg/rhai/progression"
 	jobruntimes "github.com/kubeflow/trainer/v2/pkg/runtime"
 )
@@ -52,12 +54,13 @@ type TrainJobWatcher interface {
 }
 
 type TrainJobReconciler struct {
-	log       logr.Logger
-	client    client.Client
-	apiReader client.Reader
-	recorder  record.EventRecorder
-	runtimes  map[string]jobruntimes.Runtime
-	watchers  iter.Seq[TrainJobWatcher]
+	log             logr.Logger
+	client          client.Client
+	apiReader       client.Reader
+	recorder        record.EventRecorder
+	runtimes        map[string]jobruntimes.Runtime
+	watchers        iter.Seq[TrainJobWatcher]
+	metricsRecorder *metrics.MetricsRecorder
 }
 
 type TrainJobReconcilerOptions struct {
@@ -81,12 +84,13 @@ func NewTrainJobReconciler(client client.Client, apiReader client.Reader, record
 		opt(options)
 	}
 	return &TrainJobReconciler{
-		log:       ctrl.Log.WithName("trainjob-controller"),
-		client:    client,
-		apiReader: apiReader,
-		recorder:  recorder,
-		runtimes:  runtimes,
-		watchers:  options.Watchers,
+		log:             ctrl.Log.WithName("trainjob-controller"),
+		client:          client,
+		apiReader:       apiReader,
+		recorder:        recorder,
+		runtimes:        runtimes,
+		watchers:        options.Watchers,
+		metricsRecorder: metrics.NewMetricsRecorder(),
 	}
 }
 
@@ -97,6 +101,7 @@ func NewTrainJobReconciler(client client.Client, apiReader client.Reader, record
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=create;get;list;update
 
 func (r *TrainJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	startTime := time.Now()
 	var trainJob trainer.TrainJob
 	if err := r.client.Get(ctx, req.NamespacedName, &trainJob); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -118,6 +123,7 @@ func (r *TrainJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if !ok {
 		err = fmt.Errorf("unsupported runtime: %s", runtimeRefGK)
 		setFailedCondition(&trainJob, fmt.Sprintf("unsupported runtime: %s", runtimeRefGK), trainer.TrainJobRuntimeNotSupportedReason)
+		r.metricsRecorder.RecordReconciliationError(&trainJob, "runtime_not_found")
 	} else {
 		err = r.reconcileObjects(ctx, runtime, &trainJob)
 		if err != nil {
@@ -130,10 +136,17 @@ func (r *TrainJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				message = fmt.Sprintf("%s ...", message)
 			}
 			r.recorder.Event(&trainJob, corev1.EventTypeWarning, "TrainJobResourcesCreationFailed", message)
+			r.metricsRecorder.RecordReconciliationError(&trainJob, "reconcile_objects_failed")
 		}
 	}
 
 	setSuspendedCondition(&trainJob)
+
+	// Record metrics for condition transitions
+	r.recordConditionMetrics(originStatus, &trainJob)
+
+	// Record reconciliation duration
+	r.metricsRecorder.RecordReconciliationDuration(&trainJob, time.Since(startTime))
 
 	if statusErr := setTrainJobStatus(ctx, runtime, &trainJob); statusErr != nil {
 		err = errors.Join(err, statusErr)
@@ -164,6 +177,8 @@ func (r *TrainJobReconciler) reconcileObjects(ctx context.Context, runtime jobru
 func (r *TrainJobReconciler) Create(e event.TypedCreateEvent[*trainer.TrainJob]) bool {
 	r.log.WithValues("trainJob", klog.KObj(e.Object)).Info("TrainJob create event")
 	defer r.notifyWatchers(nil, e.Object)
+	// Record TrainJob creation
+	r.metricsRecorder.RecordTrainJobCreation(e.Object)
 	return true
 }
 
@@ -236,6 +251,53 @@ func setTrainJobStatus(ctx context.Context, runtime jobruntimes.Runtime, trainJo
 		trainJob.Status = *status
 	}
 	return nil
+}
+
+func (r *TrainJobReconciler) recordConditionMetrics(originStatus *trainer.TrainJobStatus, trainJob *trainer.TrainJob) {
+	// Check for condition transitions and record metrics
+	for _, newCond := range trainJob.Status.Conditions {
+		if newCond.Status != metav1.ConditionTrue {
+			continue
+		}
+
+		// Check if this is a new condition or a status change
+		oldCond := meta.FindStatusCondition(originStatus.Conditions, newCond.Type)
+		if oldCond == nil || oldCond.Status != metav1.ConditionTrue {
+			// This is a new True condition
+			r.metricsRecorder.RecordTrainJobConditionTransition(trainJob, newCond.Type)
+
+			// Record terminal conditions
+			if newCond.Type == string(trainer.TrainJobComplete) {
+				r.metricsRecorder.RecordTrainJobCompletion(trainJob)
+			} else if newCond.Type == string(trainer.TrainJobFailed) {
+				r.metricsRecorder.RecordTrainJobFailure(trainJob)
+			}
+		}
+	}
+
+	// Track phase transitions for active gauge metric
+	oldPhase := r.getPhaseFromStatus(originStatus)
+	newPhase := r.getPhaseFromStatus(&trainJob.Status)
+	if oldPhase != newPhase {
+		r.metricsRecorder.RecordTrainJobPhaseTransition(trainJob, oldPhase, newPhase)
+	}
+}
+
+func (r *TrainJobReconciler) getPhaseFromStatus(status *trainer.TrainJobStatus) string {
+	if meta.IsStatusConditionTrue(status.Conditions, string(trainer.TrainJobSuspended)) {
+		return "Suspended"
+	}
+	if meta.IsStatusConditionTrue(status.Conditions, string(trainer.TrainJobComplete)) {
+		return "Complete"
+	}
+	if meta.IsStatusConditionTrue(status.Conditions, string(trainer.TrainJobFailed)) {
+		return "Failed"
+	}
+	// If any jobs are running, consider the TrainJob as Running
+	if len(status.JobsStatus) > 0 {
+		return "Running"
+	}
+	return "Created"
 }
 
 func (r *TrainJobReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {

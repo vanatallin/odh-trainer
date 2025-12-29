@@ -40,6 +40,7 @@ import (
 	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
 	"github.com/kubeflow/trainer/v2/pkg/config"
 	"github.com/kubeflow/trainer/v2/pkg/controller"
+	_ "github.com/kubeflow/trainer/v2/pkg/metrics" // register metrics
 	"github.com/kubeflow/trainer/v2/pkg/runtime"
 	runtimecore "github.com/kubeflow/trainer/v2/pkg/runtime/core"
 	"github.com/kubeflow/trainer/v2/pkg/util/cert"
