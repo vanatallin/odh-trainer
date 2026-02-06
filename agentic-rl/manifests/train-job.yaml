@@ -1,0 +1,94 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: agentic-rl-training
+  namespace: default
+spec:
+  # Reference to the training runtime
+  runtimeRef:
+    name: agentic-rl-pytorch
+    kind: TrainingRuntime
+    apiGroup: trainer.kubeflow.org
+
+  # Trainer configuration
+  trainer:
+    # Number of training nodes (pods)
+    numNodes: 1
+
+    # Number of processes per node (GPUs per pod)
+    numProcPerNode: 1
+
+    # Resources per node
+    resourcesPerNode:
+      requests:
+        nvidia.com/gpu: 1
+        memory: "8Gi"
+        cpu: "4"
+      limits:
+        nvidia.com/gpu: 1
+        memory: "8Gi"
+
+    # Training environment variables
+    env:
+      - name: NUM_EPOCHS
+        value: "3"
+      - name: BATCH_SIZE
+        value: "4"
+      - name: LEARNING_RATE
+        value: "1.0e-5"
+      - name: PPO_EPOCHS
+        value: "4"
+      - name: MAX_RESPONSE_LENGTH
+        value: "128"
+      - name: MODEL_NAME
+        value: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+      - name: CHECKPOINT_DIR
+        value: "/checkpoints"
+      - name: LOG_INTERVAL
+        value: "10"
+
+  # Pod template overrides for customization
+  podTemplateOverrides:
+    - targetJobs:
+        - name: node
+      spec:
+        # Override student container
+        containers:
+          - name: node
+            # Update to your custom student image
+            image: <your-registry>/student-agent:latest
+            imagePullPolicy: Always
+            env:
+              - name: WANDB_API_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: wandb-secret
+                    key: api-key
+                    optional: true
+
+          # Override reward model sidecar
+          - name: reward-model
+            # Update to your custom reward model image
+            image: <your-registry>/reward-model:latest
+            imagePullPolicy: Always
+            env:
+              - name: REWARD_MODEL_PATH
+                value: "/checkpoints/reward-model"
+
+        # Optional: Add image pull secrets
+        # imagePullSecrets:
+        #   - name: registry-secret
+
+  # Labels for organization
+  labels:
+    experiment: agentic-rl
+    framework: pytorch
+    algorithm: ppo
+
+  # Annotations for metadata
+  annotations:
+    description: "Agentic RL fine-tuning with sidecar reward model"
+    contact: "ml-team@example.com"
+
+  # Suspend the job (set to false to start immediately)
+  suspend: false

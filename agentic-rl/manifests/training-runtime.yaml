@@ -1,0 +1,121 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainingRuntime
+metadata:
+  name: agentic-rl-pytorch
+  namespace: default
+spec:
+  mlPolicy:
+    numNodes: 1
+    torch:
+      numProcPerNode: auto
+  template:
+    spec:
+      replicatedJobs:
+        - name: node
+          template:
+            metadata:
+              labels:
+                trainer.kubeflow.org/trainjob-ancestor-step: trainer
+            spec:
+              backoffLimit: 2
+              template:
+                spec:
+                  containers:
+                    # Main training container (student agent)
+                    - name: node
+                      image: pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+                      command:
+                        - python
+                        - /workspace/train.py
+                      env:
+                        - name: REWARD_MODEL_URL
+                          value: "http://localhost:8080"
+                        - name: PYTHONUNBUFFERED
+                          value: "1"
+                      resources:
+                        requests:
+                          nvidia.com/gpu: 1
+                          memory: "8Gi"
+                          cpu: "4"
+                        limits:
+                          nvidia.com/gpu: 1
+                          memory: "8Gi"
+                      volumeMounts:
+                        - name: workspace
+                          mountPath: /workspace
+                        - name: checkpoints
+                          mountPath: /checkpoints
+                        - name: dshm
+                          mountPath: /dev/shm
+
+                    # Reward model sidecar
+                    - name: reward-model
+                      image: python:3.10-slim
+                      command:
+                        - python
+                        - /app/server.py
+                      env:
+                        - name: PORT
+                          value: "8080"
+                        - name: MODEL_NAME
+                          value: "distilbert-base-uncased"
+                        - name: DEVICE
+                          value: "cuda"
+                        - name: PYTHONUNBUFFERED
+                          value: "1"
+                      ports:
+                        - containerPort: 8080
+                          name: http
+                          protocol: TCP
+                      resources:
+                        requests:
+                          nvidia.com/gpu: 1
+                          memory: "4Gi"
+                          cpu: "2"
+                        limits:
+                          nvidia.com/gpu: 1
+                          memory: "4Gi"
+                      volumeMounts:
+                        - name: checkpoints
+                          mountPath: /checkpoints
+                          readOnly: true
+                        - name: dshm
+                          mountPath: /dev/shm
+                      readinessProbe:
+                        httpGet:
+                          path: /health
+                          port: 8080
+                        initialDelaySeconds: 30
+                        periodSeconds: 10
+                        timeoutSeconds: 5
+                        failureThreshold: 3
+                      livenessProbe:
+                        httpGet:
+                          path: /health
+                          port: 8080
+                        initialDelaySeconds: 60
+                        periodSeconds: 30
+                        timeoutSeconds: 5
+                        failureThreshold: 3
+
+                  volumes:
+                    - name: workspace
+                      emptyDir: {}
+                    - name: checkpoints
+                      emptyDir: {}
+                    - name: dshm
+                      emptyDir:
+                        medium: Memory
+                        sizeLimit: 2Gi
+
+                  restartPolicy: Never
+
+                  # Optional: Node selector for GPU nodes
+                  # nodeSelector:
+                  #   node.kubernetes.io/instance-type: g4dn.xlarge
+
+                  # Optional: Tolerations for GPU nodes
+                  # tolerations:
+                  #   - key: nvidia.com/gpu
+                  #     operator: Exists
+                  #     effect: NoSchedule
